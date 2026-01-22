@@ -1,0 +1,162 @@
+name: 'LogixDev AWS App Runner Deploy'
+description: 'Deploy applications to AWS App Runner with automatic Docker building and deployment tracking'
+author: 'TahaDekmak'
+branding:
+  icon: 'upload-cloud'
+  color: 'purple'
+
+inputs:
+  deploy-type:
+    description: 'Deployment type (from-branch, from-pr, from-tag)'
+    required: true
+  environment:
+    description: 'Target environment'
+    required: true
+  ecr-repository:
+    description: 'ECR repository name'
+    required: true
+  target-url:
+    description: 'Target URL of environment'
+    required: true
+  branch:
+    description: 'Branch to deploy (for from-branch type)'
+    required: false
+    default: ''
+  pull-request-nb:
+    description: 'PR number (for from-pr type)'
+    required: false
+    default: ''
+  commit-tag:
+    description: 'Tag to deploy (for from-tag type)'
+    required: false
+    default: ''
+  sentry-project:
+    description: 'Sentry project name'
+    required: false
+    default: ''
+  sentry-org:
+    description: 'Sentry organization'
+    required: false
+    default: ''
+  sentry-environment:
+    description: 'Sentry environment'
+    required: false
+    default: ''
+  sentry-token:
+    description: 'Sentry authentication token'
+    required: false
+    default: ''
+  slack-webhook:
+    description: 'Slack webhook URL'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set deployment ref
+      shell: bash
+      run: |
+        if [ "${{ inputs.deploy-type }}" = "from-branch" ]; then
+          echo "ref=${{ inputs.branch }}" >> $GITHUB_ENV
+        elif [ "${{ inputs.deploy-type }}" = "from-tag" ]; then
+          echo "ref=${{ inputs.commit-tag }}" >> $GITHUB_ENV
+        elif [ "${{ inputs.deploy-type }}" = "from-pr" ]; then
+          echo "ref=refs/pull/${{ inputs.pull-request-nb }}/merge" >> $GITHUB_ENV
+        fi
+
+    - name: Get PR details (if from-pr)
+      if: inputs.deploy-type == 'from-pr'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        sudo apt update
+        sudo apt install -y gh
+        basebranch=$(gh pr view ${{ inputs.pull-request-nb }} --json baseRefName -q '.baseRefName')
+        prbranch=$(gh pr view ${{ inputs.pull-request-nb }} --json headRefName -q ".headRefName")
+        echo "base_branch=$basebranch" >> $GITHUB_ENV
+        echo "pr_branch=$prbranch" >> $GITHUB_ENV
+      
+    - name: Merge PR (if from-pr)
+      if: inputs.deploy-type == 'from-pr'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        git fetch
+        git checkout ${{ env.base_branch }}
+        git config --global user.name "${{ github.actor }}"
+        git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+        git merge origin/${{ env.pr_branch }}
+
+    - name: Start deployment
+      uses: bobheadxi/deployments@648679e8e4915b27893bd7dbc35cb504dc915bc8
+      id: deployment
+      with:
+        step: start
+        token: ${{ github.token }}
+        env: ${{ inputs.environment }}
+        ref: ${{ env.ref }}
+        env_url: ${{ inputs.target-url }}
+        override: true
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076
+
+    - name: Docker Setup Buildx
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      with:
+        driver-opts: image=public.ecr.aws/vend/moby/buildkit:buildx-stable-1
+
+    - name: Build, tag, and push image
+      id: build-image
+      shell: bash
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+        IMAGE_TAG: latest
+      run: |
+        docker buildx create --use
+        docker buildx build \
+          --cache-from type=registry,ref=$ECR_REGISTRY/$ECR_REPOSITORY:cache \
+          --cache-to type=registry,ref=$ECR_REGISTRY/$ECR_REPOSITORY:cache,mode=max,oci-mediatypes=true,image-manifest=true \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+          --push \
+          .
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Update deployment status
+      uses: bobheadxi/deployments@648679e8e4915b27893bd7dbc35cb504dc915bc8
+      if: always()
+      with:
+        step: finish
+        token: ${{ github.token }}
+        status: ${{ job.status }}
+        env: ${{ inputs.environment }}
+        ref: ${{ env.ref }}
+        deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+        env_url: ${{ inputs.target-url }}
+        override: true
+
+    - name: Create Sentry release
+      if: inputs.sentry-project != '' && inputs.sentry-token != ''
+      uses: getsentry/action-release@dab6548b3c03c4717878099e43782cf5be654289
+      env:
+        SENTRY_AUTH_TOKEN: ${{ inputs.sentry-token }}
+        SENTRY_ORG: ${{ inputs.sentry-org }}
+        SENTRY_PROJECT: ${{ inputs.sentry-project }}
+      with:
+        environment: ${{ inputs.sentry-environment }}
+        version: ${{ github.sha }}
+
+    - name: Slack notification
+      if: inputs.slack-webhook != ''
+      uses: rtCamp/action-slack-notify@e31e87e03dd19038e411e38ae27cbad084a90661
+      env:
+        SLACK_WEBHOOK: ${{ inputs.slack-webhook }}
+        SLACK_USERNAME: runner-deploy
+        SLACK_ICON_EMOJI: ':rocket:'
+        SLACK_TITLE: 'Deployment to ${{ inputs.environment }}'
+        SLACK_MESSAGE: '• *Repository*: ${{ github.repository }} • *Deployed By*: ${{ github.actor }} • *Ref*: ${{ env.ref }}'
